@@ -1,0 +1,102 @@
+import sys
+import re
+import json
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.utils import getResolvedOptions
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, explode, regexp_replace
+from pyspark.sql.types import StructType, StructField, ArrayType, MapType
+
+# Parameters from Glue Job arguments
+args = getResolvedOptions(sys.argv, ['JOB_NAME', 'SOURCE_S3_PATH', 'TARGET_S3_PATH'])
+
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+
+# Enable recursive file reading
+spark.conf.set("mapreduce.input.fileinputformat.input.dir.recursive", "true")
+
+# Read JSON files (including gzipped)
+df = spark.read.option("multiline", "true").json(args['SOURCE_S3_PATH'])
+
+# Function to recursively flatten structs and arrays
+def flatten_df(nested_df):
+    flat_cols = []
+    nested_cols = []
+
+    for col_name, dtype in nested_df.dtypes:
+        if dtype.startswith('struct'):
+            nested_cols.append(col_name)
+        elif dtype.startswith('array'):
+            nested_cols.append(col_name)
+        else:
+            flat_cols.append(col_name)
+
+    while len(nested_cols) != 0:
+        col_name = nested_cols.pop(0)
+        if nested_df.schema[col_name].dataType.typeName() == 'struct':
+            expanded = [col(col_name + '.' + f.name).alias(col_name + '_' + f.name) for f in nested_df.schema[col_name].dataType.fields]
+            nested_df = nested_df.select("*", *expanded).drop(col_name)
+        elif nested_df.schema[col_name].dataType.typeName() == 'array':
+            nested_df = nested_df.withColumn(col_name, explode(col(col_name)))
+
+        flat_cols = [c for c in nested_df.columns if c not in nested_cols]
+
+        for col_name, dtype in nested_df.dtypes:
+            if dtype.startswith('struct') and col_name not in nested_cols:
+                nested_cols.append(col_name)
+            elif dtype.startswith('array') and col_name not in nested_cols:
+                nested_cols.append(col_name)
+
+    return nested_df
+
+# Flatten the DataFrame
+df_flat = flatten_df(df)
+
+# Function to sanitize column names
+def sanitize_column_names(df):
+    for col_name in df.columns:
+        sanitized_name = re.sub(r'[^0-9a-zA-Z_]', '_', col_name)
+        df = df.withColumnRenamed(col_name, sanitized_name)
+    return df
+
+df_clean = sanitize_column_names(df_flat)
+
+# Write the cleaned JSON back to S3 (flattened and sanitized)
+df_clean.write.mode('overwrite').json(args['TARGET_S3_PATH'])
+
+print("Job completed successfully!")
+
+
+
+
+aws glue start-job-run --job-name your-glue-job-name --arguments '{"--SOURCE_S3_PATH":"s3://your-source-bucket/path/to/logs/","--TARGET_S3_PATH":"s3://your-destination-bucket/path/to/cleaned_logs/"}'
+
+
+	df_clean.write.partitionBy("log_date").mode('overwrite').json(args['TARGET_S3_PATH'])
+
+
+df = spark.read.option("multiline", "true").option("mode", "PERMISSIVE").json(args['SOURCE_S3_PATH'])
+
+
+{
+  "Name": "sanitize-and-flatten-logs",
+  "Role": "arn:aws:iam::123456789012:role/AWSGlueServiceRole",
+  "Command": {
+    "Name": "glueetl",
+    "ScriptLocation": "s3://your-glue-scripts-bucket/scripts/flatten_sanitize.py",
+    "PythonVersion": "3"
+  },
+  "DefaultArguments": {
+    "--SOURCE_S3_PATH": "s3://your-source-bucket/path/to/logs/",
+    "--TARGET_S3_PATH": "s3://your-destination-bucket/path/to/cleaned_logs/",
+    "--job-language": "python",
+    "--TempDir": "s3://your-temp-dir/tmp/"
+  },
+  "GlueVersion": "3.0",
+  "NumberOfWorkers": 10,
+  "WorkerType": "G.1X"
+}
+
